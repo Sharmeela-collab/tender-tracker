@@ -11,6 +11,7 @@ from google.oauth2.service_account import Credentials
 SHEET_NAME = "Tender Tracker"
 
 def get_sheet():
+    """Authenticates with Google Sheets using the JSON key from environment variables."""
     creds_json = os.environ.get("GCP_CREDENTIALS")
     if not creds_json:
         raise ValueError("Error: GCP_CREDENTIALS environment secret not found.")
@@ -22,28 +23,39 @@ def get_sheet():
     ]
     credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(credentials)
-    return gc.open(SHEET_NAME).sheet1
+    
+    sh = gc.open(SHEET_NAME).sheet1
+    if len(sh.get_all_values()) == 0:
+        sh.append_row([
+            "Date Found", "State / Source", "Tender ID", 
+            "Department / Org", "Work Description / Scope", 
+            "Closing Date", "Tender Link"
+        ])
+    return sh
 
 def save_to_sheet(sheet, tenders):
+    """Appends unique tenders to Google Sheet without duplicating existing IDs."""
     if not tenders:
-        print("\n--> No matching tenders found across all queried portals today.")
+        print("\n--> No new matching tenders found to append today.")
         return
 
     existing_records = sheet.get_all_values()
     existing_ids = set()
     if len(existing_records) > 1:
-        # Check Column C (Tender ID) to skip duplicates
         existing_ids = {row[2].strip() for row in existing_records[1:] if len(row) > 2}
 
     new_rows = []
     today = datetime.now().strftime("%Y-%m-%d")
 
     for item in tenders:
-        if item["tender_id"] not in existing_ids:
+        t_id = item["tender_id"].strip()
+        if t_id not in existing_ids:
+            existing_ids.add(t_id)
             new_rows.append([
                 today,
                 item["source"],
-                item["tender_id"],
+                t_id,
+                item["department"],
                 item["title"],
                 item["closing_date"],
                 item["link"]
@@ -51,150 +63,183 @@ def save_to_sheet(sheet, tenders):
 
     if new_rows:
         sheet.append_rows(new_rows)
-        print(f"\nSUCCESS: Added {len(new_rows)} new tenders to '{SHEET_NAME}'!")
+        print(f"\nSUCCESS: Added {len(new_rows)} new opportunities to Google Sheet!")
     else:
-        print("\nAll identified tenders are already tracked in the Google Sheet.")
+        print("\nAll matching opportunities are already logged in the sheet.")
 
-# Expanded portal list covering State, Central, and Major Infrastructure boards
+# Target State and Central E-Procurement Gateways
 PORTALS = {
-    "Maharashtra (MahaTenders / CIDCO / MMRDA / PMRDA)": "https://mahatenders.gov.in/nicgep/app",
-    "Goa eProcure (GSIDC / PWD)": "https://eprocure.goa.gov.in/nicgep/app",
-    "Madhya Pradesh (MP Tenders / MPRDC / Metro)": "https://mptenders.gov.in/nicgep/app",
-    "CPPP Central Portal (NHAI / MoRTH / Rail / Urban)": "https://eprocure.gov.in/eprocure/app"
+    "Maharashtra (MahaTenders / CIDCO / MMRDA)": "https://mahatenders.gov.in/nicgep/app",
+    "Goa eProcure (GSIDC / PWD / Transport)": "https://eprocure.goa.gov.in/nicgep/app",
+    "Madhya Pradesh (MP Tenders / Metro / MPRDC)": "https://mptenders.gov.in/nicgep/app",
+    "CPPP Central Portal (NHAI / MoRTH / MoHUA)": "https://eprocure.gov.in/eprocure/app"
 }
 
-# Targeted keywords for consultancy, transport, and project management
-KEYWORDS = [
-    r"\bpmc\b",
-    r"project management consult",
-    r"feasibility",
-    r"\bdpr\b",
-    r"detailed project report",
-    r"urban mobility",
-    r"transit",
-    r"metro",
-    r"brts",
-    r"bus terminal",
-    r"multimodal",
-    r"multi-modal",
-    r"authority engineer",
-    r"independent engineer",
-    r"highways?",
-    r"expressway",
-    r"consultan",
-    r"traffic survey",
-    r"comprehensive mobility plan",
-    r"\bcmp\b",
-    r"flyover",
-    r"ring road",
-    r"smart city",
-    r"town planning",
-    r"infrastructure advisory"
+# Search terms to query against the portal search bars
+SEARCH_TERMS = [
+    "consultan",
+    "pmc",
+    "mobility",
+    "transport",
+    "electric bus",
+    "charging",
+    "parking",
+    "advisory",
+    "empanelment",
+    "feasibility"
 ]
-KEYWORD_REGEX = re.compile("|".join(KEYWORDS), re.IGNORECASE)
+
+# Comprehensive domain regex covering transport, advisory, infrastructure, and urban mobility
+FILTER_REGEX = re.compile(
+    r"("
+    # EV & Modern Bus Transit
+    r"electric\s+bus|e-?bus|ebuses|charging\s+infra|evse|fast\s+charger|battery\s+swapp|"
+    r"gross\s+cost\s+contract|\bgcc\b|depot\s+charging|fleet\s+electrif|"
+    # Urban Transit Assets & Amenities
+    r"bus\s+shelter|bus\s+queue\s+shelter|\bbqs\b|ac\s+bus\s+shelter|bus\s+terminal|"
+    r"foot\s*over\s*bridge|\bfob\b|skywalk|pedestrian\s+underpass|subway|"
+    r"multi.?modal|mmlp|intermodal|transit.oriented|\btod\b|"
+    # Parking & Traffic Engineering
+    r"multi.?level\s+car\s+parking|\bmlcp\b|parking\s+management|on-?street\s+parking|"
+    r"fastag\s+parking|congestion|traffic\s+engineering|traffic\s+survey|traffic\s+study|"
+    r"junction\s+improvement|signaliz|adaptive\s+traffic|\batcs\b|\bits\b|blackspot|"
+    # Urban Mobility & Active Transport
+    r"urban\s+mobility|comprehensive\s+mobility|\bcmp\b|non.?motorized|\bnmt\b|"
+    r"cycle\s+track|complete\s+streets|street\s+design|pedestrianiz|"
+    # Highways, Metro & Corridors
+    r"metro\s+rail|metro\s+neo|metro\s+lite|brts|ropeway|cable\s+car|"
+    r"highways?|expressway|ring\s+road|flyover|elevated\s+corridor|bypass|tunnels?|"
+    # Institutional Strengthening & Program Management
+    r"technical\s+assistance|capacity\s+strengthen|capacity\s+build|institutional\s+strengthen|"
+    r"project\s+management\s+unit|\bpmu\b|project\s+implementation\s+unit|\bpiu\b|"
+    r"\bpmc\b|project\s+management\s+consult|project\s+monitoring|independent\s*engineer|"
+    r"authority['\s]*s?\s*engineer|proof\s+consultant|technical\s+audit|"
+    # Financial, Transaction Advisory & Delivery Models
+    r"transaction\s+advis|financial\s+advis|revenue\s+model|tariff\s+study|"
+    r"\bppp\b|dbfot|\bham\b|hybrid\s+annuity|viability\s+gap|\bvgf\b|concession\s+agreement|"
+    # Procurement Types & Project Reports
+    r"empanelment|expression\s+of\s+interest|\beoi\b|\brfp\b|\brfq\b|pre-qualification|"
+    r"detailed\s+project\s+report|\bdpr\b|feasibility\s+study|detailed\s+design|smart\s+city"
+    r")",
+    re.IGNORECASE
+)
 
 async def solve_captcha(page, selector, ocr):
+    """Takes screenshot of the captcha element and decodes text using local neural net."""
     captcha_el = await page.wait_for_selector(selector, timeout=10000)
     image_bytes = await captcha_el.screenshot()
     solved = ocr.classification(image_bytes)
     return solved.strip().replace(" ", "")
 
-async def scrape_portal(portal_label, base_url, ocr):
-    print(f"\n--------------------------------------------------")
-    print(f"Querying: {portal_label}")
-    print(f"--------------------------------------------------")
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+async def query_portal(portal_label, base_url, term, ocr, context):
+    page = await context.new_page()
+    results = []
 
-        try:
-            # Direct Active Tenders endpoint used by GePNIC engines
-            search_url = f"{base_url}?page=FrontEndLatestActiveTenders&service=page"
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
-            await asyncio.sleep(2)
+    try:
+        search_url = f"{base_url}?page=WebActiveTenders&service=page"
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=40000)
+        await asyncio.sleep(1)
 
-            # Solve CAPTCHA challenge if triggered
-            captcha_img = await page.query_selector("#captchaImage")
-            if captcha_img:
-                for attempt in range(4):
-                    code = await solve_captcha(page, "#captchaImage", ocr)
-                    print(f"[{portal_label}] Solved captcha: '{code}' (Attempt {attempt + 1})")
-                    
-                    await page.fill("#captchaText", code)
-                    submit_btn = await page.query_selector("#Submit")
-                    if submit_btn:
-                        await submit_btn.click()
-                    
-                    await page.wait_for_load_state("domcontentloaded")
-                    await asyncio.sleep(2)
+        # Enter search term
+        keyword_input = await page.query_selector("input[name='Keyword'], #Keyword, input[type='text']")
+        if keyword_input:
+            await keyword_input.fill(term)
 
-                    err = await page.query_selector("text='Invalid Captcha'")
-                    if not err and not await page.query_selector("#captchaText"):
-                        print(f"[{portal_label}] Captcha verified successfully.")
-                        break
-                    
-                    refresh_btn = await page.query_selector("#Image1")
-                    if refresh_btn:
-                        await refresh_btn.click()
-                        await asyncio.sleep(1)
+        # Solve Captcha
+        captcha_img = await page.query_selector("#captchaImage")
+        if captcha_img:
+            for attempt in range(4):
+                code = await solve_captcha(page, "#captchaImage", ocr)
+                captcha_box = await page.query_selector("#captchaText")
+                if captcha_box:
+                    await captcha_box.fill(code)
 
-            # Select results table
-            rows = await page.query_selector_all("#table tr, table.list_table tr")
-            print(f"[{portal_label}] Total tender entries on page: {len(rows)}")
+                submit_btn = await page.query_selector("#Submit")
+                if submit_btn:
+                    await submit_btn.click()
 
-            matches = []
-            for row in rows:
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(2)
+
+                err = await page.query_selector("text='Invalid Captcha'")
+                if not err and not await page.query_selector("#captchaText"):
+                    break
+
+                refresh = await page.query_selector("#Image1")
+                if refresh:
+                    await refresh.click()
+                    await asyncio.sleep(1)
+
+        # Parse matching results
+        rows = await page.query_selector_all("#table tr, table.list_table tr")
+        print(f"[{portal_label}] Query '{term}' -> {max(0, len(rows) - 1)} items.")
+
+        for row in rows:
+            text = (await row.inner_text()).strip()
+            if not text or "Tender Title" in text or "S.No" in text:
+                continue
+
+            if FILTER_REGEX.search(text):
                 cells = await row.query_selector_all("td")
-                if len(cells) < 4:
+                if len(cells) < 3:
                     continue
 
-                row_text = (await row.inner_text()).strip()
+                link_el = await row.query_selector("a")
+                href = await link_el.get_attribute("href") if link_el else ""
+                raw_title = (await link_el.inner_text()).strip() if link_el else text[:120]
 
-                if KEYWORD_REGEX.search(row_text):
-                    link_el = await row.query_selector("a")
-                    title = ""
-                    href = ""
-                    if link_el:
-                        title = (await link_el.inner_text()).strip()
-                        href = await link_el.get_attribute("href") or ""
-                    else:
-                        title = (await cells[len(cells)-2].inner_text()).strip()
+                # Date in GePNIC
+                closing_date = (await cells[2].inner_text()).strip() if len(cells) > 2 else "Check Link"
+                
+                # Department/Agency
+                department = "State Agency / ULB"
+                if len(cells) >= 5:
+                    department = (await cells[1].inner_text()).strip()
 
-                    closing_date = (await cells[2].inner_text()).strip() if len(cells) > 2 else "N/A"
-                    tender_id = (await cells[len(cells)-1].inner_text()).strip() if len(cells) > 3 else "N/A"
+                # Tender ID extraction
+                raw_id = (await cells[len(cells) - 1].inner_text()).strip() if len(cells) > 3 else ""
+                id_match = re.search(r"(\d{4}_[A-Z0-9]+_\d+|\b\d{6,}\b)", raw_id + " " + text)
+                tender_id = id_match.group(0) if id_match else re.sub(r"\W+", "_", raw_title[:30])
 
-                    clean_title = title.replace("\n", " ").strip()
-                    full_link = f"{base_url}{href}" if href.startswith("?") else href
+                clean_title = re.sub(r"\s+", " ", raw_title).strip()
+                full_link = f"{base_url}{href}" if href.startswith("?") else href
 
-                    matches.append({
-                        "source": portal_label.split(" (")[0],
-                        "tender_id": tender_id or clean_title[:20],
-                        "title": clean_title,
-                        "closing_date": closing_date,
-                        "link": full_link
-                    })
+                results.append({
+                    "source": portal_label.split(" (")[0],
+                    "tender_id": tender_id,
+                    "department": department,
+                    "title": clean_title,
+                    "closing_date": closing_date,
+                    "link": full_link or base_url
+                })
 
-            print(f"[{portal_label}] Matching tenders: {len(matches)}")
-            return matches
+    except Exception as e:
+        print(f"[{portal_label}] Query '{term}' skipped: {e}")
+    finally:
+        await page.close()
 
-        except Exception as e:
-            print(f"[{portal_label}] Crawl issue encountered: {e}")
-            return []
-        finally:
-            await browser.close()
+    return results
 
 async def main():
     sheet = get_sheet()
     ocr = ddddocr.DdddOcr(show_ad=False)
-    
-    all_tenders = []
-    for label, url in PORTALS.items():
-        tenders = await scrape_portal(label, url, ocr)
-        all_tenders.extend(tenders)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            locale="en-IN",
+            timezone_id="Asia/Kolkata"
+        )
+
+        all_tenders = []
+        for label, url in PORTALS.items():
+            print(f"\nScanning Portal: {label}")
+            for term in SEARCH_TERMS:
+                matches = await query_portal(label, url, term, ocr, context)
+                all_tenders.extend(matches)
+
+        await browser.close()
 
     save_to_sheet(sheet, all_tenders)
 
