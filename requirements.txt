@@ -1,0 +1,5 @@
+playwright>=1.40.0
+ddddocr>=1.4.7
+Pillow>=10.0.0
+gspread>=6.0.0
+google-auth>=2.20.0
