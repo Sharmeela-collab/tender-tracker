@@ -1,41 +1,40 @@
 name: Daily Tender Tracker
 
-    on:
-      schedule:
-        # 02:30 UTC = 08:00 AM Indian Standard Time (IST)
-        - cron: '30 2 * * *'
-      workflow_dispatch:
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
 
-    concurrency:
-      group: tender-tracker-job
-      cancel-in-progress: true
+concurrency:
+  group: tender-tracker-job
+  cancel-in-progress: true
 
-    jobs:
-      run-tracker:
-        runs-on: ubuntu-latest
-        timeout-minutes: 15
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
-        steps:
-          - name: Check out files
-            uses: actions/checkout@v4
+    steps:
+      - name: Check out files
+        uses: actions/checkout@v4
 
-          - name: Set up Python
-            uses: actions/setup-python@v5
-            with:
-              python-version: '3.11'
-              cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-          - name: Install Python packages
-            run: |
-              python -m pip install --upgrade pip
-              pip install -r requirements.txt
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-          - name: Install Chromium browser
-            run: |
-              playwright install --with-deps chromium
+      - name: Install Chromium browser
+        run: |
+          playwright install --with-deps chromium
 
-          - name: Run Scraper and Update Google Sheet
-            env:
-              GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
-            run: |
-              python scraper.py
+      - name: Run Scraper and Update Google Sheet
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          python scraper.py
