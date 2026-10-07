@@ -44,13 +44,13 @@ def get_sheet():
 
 def save_to_sheet(sheet, tenders):
     if not tenders:
-        print("\n--> No tenders to save today.")
+        print("\n--> No new genuine tenders found today.")
         return
 
     existing_records = sheet.get_all_values()
     existing_ids = set()
     if len(existing_records) > 1:
-        # Tender ID is Column D (index 3)
+        # Column D (index 3) is Tender ID
         existing_ids = {row[3].strip() for row in existing_records[1:] if len(row) > 3}
 
     new_rows = []
@@ -58,7 +58,7 @@ def save_to_sheet(sheet, tenders):
 
     for item in tenders:
         t_id = item["tender_id"].strip()
-        if t_id and t_id not in existing_ids and "captcha" not in t_id.lower():
+        if t_id and t_id not in existing_ids:
             existing_ids.add(t_id)
             new_rows.append([
                 today,
@@ -75,10 +75,10 @@ def save_to_sheet(sheet, tenders):
     if new_rows:
         sheet.append_rows(new_rows)
         print(f"\n=======================================================")
-        print(f" SUCCESS: SAVED {len(new_rows)} NEW TENDERS TO GOOGLE SHEET!")
+        print(f" SUCCESS: SAVED {len(new_rows)} GENUINE TENDERS TO GOOGLE SHEET!")
         print(f"=======================================================")
     else:
-        print("\nAll captured tenders already exist in Google Sheet.")
+        print("\nAll tenders captured already exist in Google Sheet.")
 
 PORTALS = {
     "Maharashtra": "https://mahatenders.gov.in/nicgep/app",
@@ -88,6 +88,15 @@ PORTALS = {
 }
 
 DATE_REGEX = re.compile(r"\b\d{1,2}-[A-Za-z]{3}-\d{4}(?:\s+\d{1,2}:\d{2}\s+(?:AM|PM))?\b", re.IGNORECASE)
+
+# Words that indicate a row is a sorting tool, filter, or UI button, NOT a tender
+UI_NOISE_PATTERN = re.compile(
+    r"select\s+sorting|sorting\s+option|tender\s+id\s*$|published\s+date\s*$|"
+    r"closing\s+date\s*$|opening\s+date\s*$|screen\s+reader|search\s+tenders|"
+    r"advanced\s+search|corrigendum|results\s+of\s+tenders|tender\s+status|"
+    r"clear\s*$|back\s*$|submit\s*$|captcha",
+    re.IGNORECASE
+)
 
 async def solve_captcha(page, ocr):
     captcha_el = await page.wait_for_selector("#captchaImage", timeout=10000)
@@ -110,7 +119,7 @@ async def scrape_portal(portal_label, base_url, ocr, context):
         await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(2)
 
-        # 1. Handle CAPTCHA if presented
+        # 1. Solve CAPTCHA if prompted
         for attempt in range(5):
             captcha_input = await page.query_selector("#captchaText")
             if not captcha_input or not await captcha_input.is_visible():
@@ -143,6 +152,7 @@ async def scrape_portal(portal_label, base_url, ocr, context):
             await asyncio.sleep(3)
 
             if not await page.query_selector("#captchaText"):
+                print(f"[{portal_label}] Captcha solved successfully!")
                 break
             else:
                 refresh_btn = await page.query_selector("#Image1, a[title*='Refresh']")
@@ -150,61 +160,55 @@ async def scrape_portal(portal_label, base_url, ocr, context):
                     await refresh_btn.click()
                     await asyncio.sleep(2)
 
-        # 2. Extract Data from Results Table
-        try:
-            await page.wait_for_selector("#table, table.list_table", timeout=10000)
-        except Exception:
-            pass
+        # 2. Find ONLY links that lead to actual tender details
+        # GePNIC tender title links have href with 'FrontEndTenderDetails' or 'tender' or 'direct=1'
+        tender_links = await page.query_selector_all(
+            "a[href*='TenderDetails'], a[href*='page=FrontEndTenderDetails'], a[href*='direct=1'], a[id*='DirectLink']"
+        )
+        print(f"[{portal_label}] Genuine tender links found: {len(tender_links)}")
 
-        rows = await page.query_selector_all("#table tr, table.list_table tr")
-        print(f"[{portal_label}] Parsing {len(rows)} table rows...")
+        for link in tender_links:
+            title = (await link.inner_text()).strip()
+            href = await link.get_attribute("href") or ""
 
-        for row in rows:
-            cells = await row.query_selector_all("td")
-            # Must have at least 2 cells to be a valid data row (S.No and Content)
-            if len(cells) < 2:
+            # Discard any empty text or UI artifacts
+            if not title or len(title) < 10 or UI_NOISE_PATTERN.search(title):
                 continue
 
-            row_text = (await row.inner_text()).strip()
-            
-            # Skip table header and UI junk
-            if not row_text or "Tender Title" in row_text or "S.No" in row_text or "Screen Reader" in row_text:
-                continue
+            # Get parent row to extract dates, department, and ID
+            row = await link.evaluate_handle("el => el.closest('tr')")
+            row_text = (await row.inner_text()).strip() if row else ""
+            cells = await row.query_selector_all("td") if row else []
 
-            # Look for link inside the row
-            link_el = await row.query_selector("a")
-            href = ""
-            link_text = ""
-            if link_el:
-                href = await link_el.get_attribute("href") or ""
-                link_text = (await link_el.inner_text()).strip()
-
-            # Find all dates in the row
+            # Extract dates
             found_dates = DATE_REGEX.findall(row_text)
-            
-            # Bid Submission Date is typically the first or second date found
-            submission_date = found_dates[1] if len(found_dates) > 1 else (found_dates[0] if found_dates else "Check Portal")
+            submission_date = "Check Link"
+            if len(found_dates) >= 2:
+                submission_date = found_dates[1]
+            elif len(found_dates) == 1:
+                submission_date = found_dates[0]
 
-            # Extract Title: use link text if meaningful, otherwise clean the cell content
-            title = link_text if len(link_text) > 8 else row_text.split("\n")[0]
-            title = re.sub(r"\s+", " ", title).strip()
+            # Extract Organisation Name
+            org = "State Authority / ULB"
+            if len(cells) >= 4:
+                # Column 1 or 2 often has the Dept
+                for c in cells:
+                    c_txt = (await c.inner_text()).strip()
+                    if len(c_txt) > 3 and not DATE_REGEX.search(c_txt) and c_txt != title and not UI_NOISE_PATTERN.search(c_txt):
+                        org = c_txt
+                        break
 
-            # Tender ID / Reference No extraction
-            id_match = re.search(r"(\d{4}_[A-Z0-9]+_\d+|\b\d{6,}\b)", row_text)
+            # Extract Tender ID
+            id_match = re.search(r"(\d{4}_[A-Z0-9]+_\d+|\b[0-9]{6,}\b)", row_text)
             if id_match:
                 tender_id = id_match.group(0)
             else:
-                # Use clean alphanumeric chunk from row
-                clean_ref = re.sub(r"[^\w\-_/]", "", title[:25])
-                tender_id = clean_ref if len(clean_ref) > 4 else f"{portal_label[:2]}_{len(results)+1}"
+                tender_id = re.sub(r"[^\w\-_/]", "", title[:25])
 
-            # Organisation
-            org = "State Authority / ULB"
-            lines = [l.strip() for l in row_text.split("\n") if len(l.strip()) > 3]
-            if len(lines) > 2 and not DATE_REGEX.search(lines[1]):
-                org = lines[1]
+            if UI_NOISE_PATTERN.search(tender_id):
+                tender_id = f"TND_{len(results)+1}"
 
-            # Pre-bid Meeting Date
+            # Pre-bid meeting date
             pre_bid_match = re.search(r"pre-?bid[^\n:]*[:\s]+([0-9A-Za-z\s:-]{8,25})", row_text, re.IGNORECASE)
             pre_bid_date = pre_bid_match.group(1).strip() if pre_bid_match else "See RFP Document"
 
@@ -220,17 +224,17 @@ async def scrape_portal(portal_label, base_url, ocr, context):
                 "state": portal_label,
                 "organisation": org,
                 "tender_id": tender_id,
-                "title": title,
+                "title": re.sub(r"\s+", " ", title),
                 "category": category,
                 "pre_bid_date": pre_bid_date,
                 "submission_date": submission_date,
                 "link": full_link
             })
 
-        print(f"[{portal_label}] Extracted {len(results)} tenders.")
+        print(f"[{portal_label}] Clean tenders extracted: {len(results)}")
 
     except Exception as e:
-        print(f"[{portal_label}] Crawl notice: {e}")
+        print(f"[{portal_label}] Notice: {e}")
     finally:
         await page.close()
 
