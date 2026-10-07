@@ -11,10 +11,9 @@ from google.oauth2.service_account import Credentials
 SHEET_NAME = "Tender Tracker"
 
 def get_sheet():
-    """Connects to Google Sheets using the GitHub Secret."""
     creds_json = os.environ.get("GCP_CREDENTIALS")
     if not creds_json:
-        raise ValueError("Error: GCP_CREDENTIALS not found in environment secrets.")
+        raise ValueError("Error: GCP_CREDENTIALS not found in environment.")
     
     creds_dict = json.loads(creds_json)
     scopes = [
@@ -34,15 +33,13 @@ def get_sheet():
     return sh
 
 def save_to_sheet(sheet, tenders):
-    """Appends all tenders without requiring any keyword match."""
     if not tenders:
-        print("\n--> No tenders extracted from portals today.")
+        print("\n--> No valid tenders to append today.")
         return
 
     existing_records = sheet.get_all_values()
     existing_ids = set()
     if len(existing_records) > 1:
-        # Tender ID is Column C (index 2)
         existing_ids = {row[2].strip() for row in existing_records[1:] if len(row) > 2}
 
     new_rows = []
@@ -50,7 +47,8 @@ def save_to_sheet(sheet, tenders):
 
     for item in tenders:
         t_id = item["tender_id"].strip()
-        if t_id not in existing_ids:
+        # Ensure it's not a garbage row or UI artifact
+        if t_id and t_id not in existing_ids and "Captcha" not in t_id:
             existing_ids.add(t_id)
             new_rows.append([
                 today,
@@ -65,112 +63,133 @@ def save_to_sheet(sheet, tenders):
     if new_rows:
         sheet.append_rows(new_rows)
         print(f"\n=======================================================")
-        print(f" SUCCESS: WROTE {len(new_rows)} TENDERS TO YOUR GOOGLE SHEET!")
+        print(f" SUCCESS: SAVED {len(new_rows)} REAL TENDERS TO GOOGLE SHEET!")
         print(f"=======================================================")
     else:
-        print("\nAll tenders extracted are already present in your sheet.")
+        print("\nNo new unique tenders to add.")
 
 PORTALS = {
-    "Maharashtra (MahaTenders)": "https://mahatenders.gov.in/nicgep/app",
-    "Goa eProcure": "https://eprocure.goa.gov.in/nicgep/app",
-    "Madhya Pradesh Tenders": "https://mptenders.gov.in/nicgep/app",
+    "Maharashtra": "https://mahatenders.gov.in/nicgep/app",
+    "Goa": "https://eprocure.goa.gov.in/nicgep/app",
+    "Madhya Pradesh": "https://mptenders.gov.in/nicgep/app",
     "Central CPPP": "https://eprocure.gov.in/eprocure/app"
 }
 
+# Negative filter to completely ignore form UI rows
+GARBAGE_PATTERNS = re.compile(
+    r"enter captcha|captcha text|refresh|search|s\.no|tender title|bid opening date|"
+    r"click here to view|advanced search|tender search", 
+    re.IGNORECASE
+)
+
 async def solve_captcha(page, selector, ocr):
-    """Takes a snapshot of the captcha and extracts characters."""
     captcha_el = await page.wait_for_selector(selector, timeout=10000)
     image_bytes = await captcha_el.screenshot()
     solved = ocr.classification(image_bytes)
-    return solved.strip().replace(" ", "")
+    return re.sub(r"[^a-zA-Z0-9]", "", solved.strip())
 
-async def scrape_all_tenders(portal_label, base_url, ocr, context):
+async def scrape_portal(portal_label, base_url, ocr, context):
     print(f"\n--------------------------------------------------")
-    print(f"Fetching ALL tenders from: {portal_label}")
+    print(f"Opening: {portal_label}")
     print(f"--------------------------------------------------")
     
     page = await context.new_page()
     results = []
 
     try:
-        # Load the latest active tenders endpoint
         search_url = f"{base_url}?page=FrontEndLatestActiveTenders&service=page"
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+        await page.goto(search_url, wait_until="networkidle", timeout=45000)
         await asyncio.sleep(2)
 
-        # Solve Captcha if present
+        # 1. Handle CAPTCHA Submission
         captcha_img = await page.query_selector("#captchaImage")
         if captcha_img:
-            for attempt in range(4):
+            for attempt in range(5):
                 code = await solve_captcha(page, "#captchaImage", ocr)
-                print(f"[{portal_label}] Captcha code: '{code}' (Attempt {attempt + 1})")
+                print(f"[{portal_label}] Attempt {attempt + 1}: Solved as '{code}'")
+
+                captcha_input = await page.wait_for_selector("#captchaText")
+                await captcha_input.fill("")
+                await captcha_input.type(code, delay=50)
+
+                # Press Enter key inside the field to trigger form submission reliably
+                await captcha_input.press("Enter")
                 
-                await page.fill("#captchaText", code)
+                # Also click Submit button if present
                 submit_btn = await page.query_selector("#Submit")
                 if submit_btn:
-                    await submit_btn.click()
+                    try:
+                        await submit_btn.click(timeout=3000)
+                    except Exception:
+                        pass
 
                 await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
-                err = await page.query_selector("text='Invalid Captcha'")
-                if not err and not await page.query_selector("#captchaText"):
-                    print(f"[{portal_label}] Captcha cleared successfully!")
+                # Check if captcha form is gone (success)
+                still_has_captcha = await page.query_selector("#captchaText")
+                if not still_has_captcha:
+                    print(f"[{portal_label}] CAPTCHA bypassed successfully!")
                     break
+                
+                # If still present, click refresh icon and retry
+                print(f"[{portal_label}] CAPTCHA was incorrect, refreshing...")
+                refresh_btn = await page.query_selector("#Image1")
+                if refresh_btn:
+                    await refresh_btn.click()
+                    await asyncio.sleep(2)
 
-                refresh = await page.query_selector("#Image1")
-                if refresh:
-                    await refresh.click()
-                    await asyncio.sleep(1)
+        # 2. Extract ONLY valid tender link anchors
+        # In GePNIC, tender rows always contain an anchor linking to the tender's view page
+        anchor_elements = await page.query_selector_all("table a[href*='page='], table a[href*='service=page']")
+        print(f"[{portal_label}] Found {len(anchor_elements)} clickable tender links.")
 
-        # Parse every row found in the table (NO KEYWORD FILTER)
-        rows = await page.query_selector_all("#table tr, table.list_table tr, table.table-bordered tr")
-        print(f"[{portal_label}] Total rows detected: {len(rows)}")
+        for a in anchor_elements:
+            raw_text = (await a.inner_text()).strip()
+            href = await a.get_attribute("href") or ""
 
-        for row in rows:
-            text = (await row.inner_text()).strip()
-            # Skip header lines
-            if not text or "Tender Title" in text or "S.No" in text:
+            # Skip header links, navigation links, and captcha elements
+            if not raw_text or GARBAGE_PATTERNS.search(raw_text) or len(raw_text) < 5:
                 continue
 
-            cells = await row.query_selector_all("td")
-            if len(cells) < 3:
-                continue
+            # Find parent table row to get metadata (closing date, department, ID)
+            row = await a.evaluate_handle("el => el.closest('tr')")
+            cells = await row.query_selector_all("td") if row else []
+            
+            closing_date = "Check Link"
+            department = "State Authority"
+            raw_id = ""
 
-            link_el = await row.query_selector("a")
-            href = await link_el.get_attribute("href") if link_el else ""
-            raw_title = (await link_el.inner_text()).strip() if link_el else text[:120]
+            if len(cells) >= 3:
+                # In GePNIC Active Tenders:
+                # Cell 0: S.No
+                # Cell 1: e-Published Date
+                # Cell 2: Closing Date
+                # Cell 3: Opening Date
+                # Cell 4: Title and Ref No
+                closing_date = (await cells[2].inner_text()).strip()
+                if len(cells) >= 5:
+                    department = (await cells[1].inner_text()).strip()
+                raw_id = (await cells[len(cells) - 1].inner_text()).strip()
 
-            # Closing date
-            closing_date = (await cells[2].inner_text()).strip() if len(cells) > 2 else "Check Link"
+            id_match = re.search(r"(\d{4}_[A-Z0-9]+_\d+|\b\d{6,}\b)", raw_id + " " + raw_text)
+            tender_id = id_match.group(0) if id_match else re.sub(r"\W+", "_", raw_text[:25])
 
-            # Department / Organisation
-            department = "Government Dept / ULB"
-            if len(cells) >= 5:
-                department = (await cells[1].inner_text()).strip()
-
-            # Tender ID
-            raw_id = (await cells[len(cells) - 1].inner_text()).strip() if len(cells) > 3 else ""
-            id_match = re.search(r"(\d{4}_[A-Z0-9]+_\d+|\b\d{6,}\b)", raw_id + " " + text)
-            tender_id = id_match.group(0) if id_match else re.sub(r"\W+", "_", raw_title[:25])
-
-            clean_title = re.sub(r"\s+", " ", raw_title).strip()
             full_link = f"{base_url}{href}" if href.startswith("?") else href
 
-            # Capture ANY tender unconditionally
             results.append({
-                "source": portal_label.split(" (")[0],
-                "tender_id": tender_id or clean_title[:20],
+                "source": portal_label,
+                "tender_id": tender_id,
                 "department": department,
-                "title": clean_title,
+                "title": re.sub(r"\s+", " ", raw_text),
                 "closing_date": closing_date,
                 "link": full_link or base_url
             })
 
-        print(f"[{portal_label}] Captured {len(results)} tenders.")
+        print(f"[{portal_label}] Clean tenders extracted: {len(results)}")
 
     except Exception as e:
-        print(f"[{portal_label}] Notice: {e}")
+        print(f"[{portal_label}] Crawl notice: {e}")
     finally:
         await page.close()
 
@@ -190,7 +209,7 @@ async def main():
 
         all_tenders = []
         for label, url in PORTALS.items():
-            tenders = await scrape_all_tenders(label, url, ocr, context)
+            tenders = await scrape_portal(label, url, ocr, context)
             all_tenders.extend(tenders)
 
         await browser.close()
