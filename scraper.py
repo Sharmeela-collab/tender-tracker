@@ -50,6 +50,7 @@ def save_to_sheet(sheet, tenders):
     existing_records = sheet.get_all_values()
     existing_ids = set()
     if len(existing_records) > 1:
+        # Tender ID is Column D (index 3)
         existing_ids = {row[3].strip() for row in existing_records[1:] if len(row) > 3}
 
     new_rows = []
@@ -100,7 +101,6 @@ async def scrape_portal(portal_label, base_url, ocr, context):
     print(f"--------------------------------------------------")
     
     page = await context.new_page()
-    # Auto-accept JavaScript alert dialogs
     page.on("dialog", lambda dialog: asyncio.create_task(dialog.accept()))
     
     results = []
@@ -124,7 +124,6 @@ async def scrape_portal(portal_label, base_url, ocr, context):
             await captcha_input.type(code, delay=30)
             await asyncio.sleep(1)
 
-            # Submit via the native button or JavaScript trigger
             submitted = False
             submit_buttons = await page.query_selector_all("input[type='submit'], input[name='Submit'], #Submit")
             for btn in submit_buttons:
@@ -147,20 +146,17 @@ async def scrape_portal(portal_label, base_url, ocr, context):
                 pass
             await asyncio.sleep(3)
 
-            # Check if CAPTCHA succeeded
             still_captcha = await page.query_selector("#captchaText")
             if not still_captcha:
                 print(f"[{portal_label}] CAPTCHA bypassed successfully!")
                 break
             else:
-                # Click refresh if still stuck
                 refresh_btn = await page.query_selector("#Image1, a[title*='Refresh']")
                 if refresh_btn:
                     await refresh_btn.click()
                     await asyncio.sleep(2)
 
         # 2. Extract Data from Results Table
-        # Wait up to 10s for the tender table
         try:
             await page.wait_for_selector("#table, table.list_table, tr.even, tr.odd", timeout=10000)
         except Exception:
@@ -174,4 +170,90 @@ async def scrape_portal(portal_label, base_url, ocr, context):
             if len(cells) < 4:
                 continue
 
-            row_text = (await row.inner_text()).
+            row_text = (await row.inner_text()).strip()
+            if "Tender Title" in row_text or "S.No" in row_text or "Screen Reader" in row_text:
+                continue
+
+            link_el = await row.query_selector("a")
+            if not link_el:
+                continue
+
+            raw_title = (await link_el.inner_text()).strip()
+            href = await link_el.get_attribute("href") or ""
+
+            if not raw_title or len(raw_title) < 5 or "Click" in raw_title:
+                continue
+
+            # Bid Submission Date
+            submission_date = "Check Link"
+            if len(cells) >= 3:
+                c_date = (await cells[2].inner_text()).strip()
+                if DATE_REGEX.search(c_date):
+                    submission_date = c_date
+
+            # Organisation
+            organisation = "State Department / Agency"
+            if len(cells) >= 6:
+                organisation = (await cells[len(cells)-2].inner_text()).strip()
+            elif len(cells) >= 5:
+                organisation = (await cells[1].inner_text()).strip()
+
+            # Pre-bid Meeting Date
+            pre_bid_match = re.search(r"pre-?bid[^\n:]*[:\s]+([0-9A-Za-z\s:-]{8,25})", row_text, re.IGNORECASE)
+            pre_bid_date = pre_bid_match.group(1).strip() if pre_bid_match else "See RFP Document"
+
+            # Category
+            category = "General / Services"
+            cat_match = re.search(r"\b(Services|Works|Goods|Consultancy)\b", row_text, re.IGNORECASE)
+            if cat_match:
+                category = cat_match.group(0).capitalize()
+
+            # Tender ID
+            id_match = re.search(r"(\d{4}_[A-Z0-9]+_\d+|\b[0-9]{6,}\b)", row_text)
+            tender_id = id_match.group(0) if id_match else re.sub(r"\W+", "_", raw_title[:25])
+
+            full_link = f"{base_url}{href}" if href.startswith("?") else href
+
+            results.append({
+                "state": portal_label,
+                "organisation": organisation,
+                "tender_id": tender_id,
+                "title": re.sub(r"\s+", " ", raw_title).strip(),
+                "category": category,
+                "pre_bid_date": pre_bid_date,
+                "submission_date": submission_date,
+                "link": full_link or base_url
+            })
+
+        print(f"[{portal_label}] Valid tenders extracted: {len(results)}")
+
+    except Exception as e:
+        print(f"[{portal_label}] Crawl notice: {e}")
+    finally:
+        await page.close()
+
+    return results
+
+async def main():
+    sheet = get_sheet()
+    ocr = ddddocr.DdddOcr(show_ad=False)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            locale="en-IN",
+            timezone_id="Asia/Kolkata"
+        )
+
+        all_tenders = []
+        for label, url in PORTALS.items():
+            tenders = await scrape_portal(label, url, ocr, context)
+            all_tenders.extend(tenders)
+
+        await browser.close()
+
+    save_to_sheet(sheet, all_tenders)
+
+if __name__ == "__main__":
+    asyncio.run(main())
